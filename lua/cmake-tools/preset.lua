@@ -2,7 +2,7 @@ local Path = require("plenary.path")
 local osys = require("cmake-tools.osys")
 
 local Preset = {}
-
+local function is_path() end
 local function expandMacro(self, str)
   if type(str) == "table" and str.value ~= nil then
     str = str.value
@@ -34,6 +34,13 @@ local function expandMacro(self, str)
   str = str:gsub("${fileDir}", source_path.filename)
   str = str:gsub("${dollar}", "$")
   str = str:gsub("${pathListSep}", "/")
+
+  if osys.iswin32 then
+    local path = Path:new(str)
+    if path:exists() then
+      str = str:gsub("/", "\\")
+    end
+  end
 
   return str
 end
