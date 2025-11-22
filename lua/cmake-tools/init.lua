@@ -115,7 +115,16 @@ function cmake.generate(opt, callback)
   if presets_exists then
     local presets = Presets:parse(config.cwd)
 
-    if not config.configure_preset then
+    local find_preset = false
+    if config.configure_preset then
+      local configure_preset =
+        presets:get_configure_preset(config.configure_preset, { include_hidden = true })
+      if configure_preset then
+        find_preset = true
+      end
+    end
+
+    if (not config.configure_preset) or (find_preset == false) then
       -- try to determine the confiure preset based on the build preset
       if config.build_preset then
         local build_preset = presets:get_build_preset(config.build_preset)
@@ -128,7 +137,7 @@ function cmake.generate(opt, callback)
         end
       end
 
-      if not config.configure_preset then
+      if (not config.configure_preset) or (find_preset == false) then
         -- this will also set value for build type from preset.
         -- default to be "Debug"
         return cmake.select_configure_preset(function(result)
@@ -142,7 +151,7 @@ function cmake.generate(opt, callback)
       return
     end
 
-    if config.configure_preset then
+    if config.configure_preset and find_preset then
       -- if exsist preset file and set configure preset, then
       -- set build directory to the `binaryDir` option of `configurePresets`
       local preset = presets:get_configure_preset(config.configure_preset)
@@ -156,6 +165,9 @@ function cmake.generate(opt, callback)
         end
         return
       end
+
+      config:update_build_type()
+
       local build_directory, no_expand_build_directory = preset.binaryDirExpanded, preset.binaryDir
       if build_directory ~= "" then
         config:update_build_dir(build_directory, no_expand_build_directory)
@@ -324,14 +336,46 @@ function cmake.build(opt, callback)
     -- configure it
     return cmake.generate({ bang = false, fargs = {} }, function(result)
       if result:is_ok() then
-        cmake.build(opt, callback)
+        if
+          config:has_build_directory() and config:get_codemodel_targets().code == Types.SUCCESS
+        then
+          cmake.build(opt, callback)
+        end
       else
         callback(result)
       end
     end)
   end
 
-  if opt.target == nil and config.build_target == nil then
+  local presets_exists = config.base_settings.use_preset and Presets.exists(config.cwd)
+  if presets_exists then
+    local presets = Presets:parse(config.cwd)
+    if not config.build_preset then
+      return cmake.select_build_preset(function(result)
+        if not result:is_ok() then
+          callback(result)
+          return
+        end
+        cmake.generate({ bang = false, fargs = {} }, function(generate_result)
+          if not generate_result:is_ok() then
+            callback(generate_result)
+            return
+          end
+          cmake.build(opt, callback)
+        end)
+      end)
+    end
+    if config.build_preset then
+      local build_preset = presets:get_build_preset(config.build_preset)
+      if build_preset then
+        config:update_build_target()
+        config:update_build_type()
+      end
+    end
+  end
+
+  -- If presets exists, use build target from it
+  if presets_exists == false and opt.target == nil and config.build_target == nil then
     return cmake.select_build_target(true, function(result)
       if result:is_ok() then
         cmake.build(opt, callback)
@@ -342,7 +386,6 @@ function cmake.build(opt, callback)
   end
 
   local args
-  local presets_exists = config.base_settings.use_preset and Presets.exists(config.cwd)
 
   if presets_exists and config.build_preset then
     args = { "--build", "--preset", config.build_preset } -- preset don't need define build dir.
@@ -356,11 +399,8 @@ function cmake.build(opt, callback)
   if opt.target ~= nil then
     vim.list_extend(args, { "--target", opt.target })
     vim.list_extend(args, fargs)
-  elseif config.build_target == "all" then
-    vim.list_extend(args, { "--target", "all" })
-    vim.list_extend(args, fargs)
-  else
-    vim.list_extend(args, { "--target", config.build_target })
+  elseif config.build_target ~= nil then
+    vim.list_extend(args, { "--target", unpack(config.build_target) })
     vim.list_extend(args, fargs)
   end
 
@@ -461,6 +501,17 @@ end
 
 function cmake.open_runner()
   utils.show_runner(config.runner)
+end
+
+function cmake.open_cache()
+  local path = cmake.get_build_directory() .. "/CMakeCache.txt"
+  local file = io.open(path, "r")
+  if file then
+    file:close()
+    vim.cmd("edit " .. path)
+  else
+    vim.notify("CMakeCache.txt not found", vim.log.levels.ERROR)
+  end
 end
 
 function cmake.substitute_path(path, vars)
@@ -805,11 +856,7 @@ function cmake.select_build_preset(callback)
     local presets = Presets:parse(config.cwd)
     local build_preset_names =
       presets:get_build_preset_names({ include_disabled = config:show_disabled_build_presets() })
-    build_preset_names = vim.list_extend(build_preset_names, { "None" })
     local format_preset_name = function(p_name)
-      if p_name == "None" then
-        return p_name
-      end
       local p = presets:get_build_preset(p_name)
       return p.displayName or p.name
     end
@@ -817,15 +864,19 @@ function cmake.select_build_preset(callback)
       build_preset_names,
       { prompt = "Select cmake build presets", format_item = format_preset_name },
       vim.schedule_wrap(function(choice)
-        if not choice or choice == "None" then
-          if choice == "None" then
-            config.build_preset = nil
-          end
+        if not choice then
           callback(Result:new_error(Types.NOT_SELECT_PRESET, "No build preset selected"))
           return
         end
         if config.build_preset ~= choice then
-          config.build_preset = choice
+          local build_preset = presets:get_build_preset(choice)
+          if build_preset:is_valid() then
+            config.build_preset = choice
+
+            if build_preset then
+              config:update_build_target()
+            end
+          end
         end
         local associated_configure_preset = presets:get_configure_preset(
           presets:get_build_preset(choice).configurePreset,
@@ -836,7 +887,10 @@ function cmake.select_build_preset(callback)
           or nil
         local configure_preset_updated = false
 
-        if config.configure_preset ~= associated_configure_preset_name then
+        if
+          associated_configure_preset_name
+          and config.configure_preset ~= associated_configure_preset_name
+        then
           config.configure_preset = associated_configure_preset_name
           configure_preset_updated = true
         end
@@ -853,7 +907,7 @@ function cmake.select_build_preset(callback)
 end
 
 function cmake.select_build_target(regenerate, callback)
-  callback = type(callback) == "function" and callback or function() end
+  callback = type(callback) == "function" and callback or function(_) end
   if not (config:has_build_directory()) then
     -- configure it
     return cmake.generate({ bang = false, fargs = {} }, function(result)
@@ -891,7 +945,7 @@ function cmake.select_build_target(regenerate, callback)
         callback(Result:new_error(Types.NOT_SELECT_BUILD_TARGET, "No target selected: cancelled"))
         return
       end
-      config.build_target = targets[idx]
+      config.build_target = { targets[idx] }
       callback(Result:new(Types.SUCCESS, config.build_target, nil))
     end)
   )
@@ -990,8 +1044,20 @@ end
 function cmake.get_target_vars(target)
   local vars = cmake.get_base_vars()
 
-  local model = config:get_code_model_info()[target]
+  config:update_build_directory()
+
+  local codemodel = config:get_code_model_info()
+  if not codemodel then
+    return
+  end
+  local model = codemodel[target]
+  if not model then
+    return
+  end
   local result = config:get_launch_target_from_info(model)
+  if result.code ~= Types.SUCCESS then
+    return
+  end
   vars.dir.binary = utils.get_path(result.data)
   return vars
 end
@@ -1061,8 +1127,13 @@ function cmake.target_settings(opt)
       inherit_base_environment = true,
       env = {},
     })
+    local target_vars = cmake.get_target_vars(target)
+    if not target_vars then
+      log.info("Target has not been configured!")
+      return
+    end
 
-    local content = "local vars = " .. vim.inspect(cmake.get_target_vars(target))
+    local content = "local vars = " .. vim.inspect(target_vars)
     content = content .. "\nreturn " .. vim.inspect(config.target_settings[target])
 
     window.set_content(content)
@@ -1077,20 +1148,38 @@ function cmake.target_settings(opt)
   end
 end
 
-function cmake.run_test(opt)
+function cmake.run_test(opt, callback)
+  callback = callback or function() end
   if utils.has_active_job(config.runner, config.executor) then
     return
   end
-  local env = environment.get_build_environment(config)
-  local all_tests = ctest.list_all_tests(config:build_directory_path())
-  if #all_tests == 0 then
+  if get_cmake_configuration_or_notify(callback) == nil then
     return
   end
-  table.insert(all_tests, 1, "all")
-  vim.ui.select(
-    all_tests,
-    { prompt = "select test to run" },
-    vim.schedule_wrap(function(_, idx)
+
+  local ct = config:get_codemodel_targets()
+  if not (config:has_build_directory()) or not (ct.code == Types.SUCCESS) then
+    -- configure it
+    return cmake.generate({ bang = false, fargs = {} }, function(result)
+      if result:is_ok() then
+        if
+          config:has_build_directory() and config:get_codemodel_targets().code == Types.SUCCESS
+        then
+          cmake.run_test(opt, callback)
+        end
+      else
+        callback(result)
+      end
+    end)
+  end
+
+  local env = environment.get_build_environment(config)
+  ctest.list_all_tests(config:build_directory_path(), function(all_tests)
+    if #all_tests == 0 then
+      return
+    end
+    table.insert(all_tests, 1, "all")
+    vim.ui.select(all_tests, { prompt = "select test to run" }, function(_, idx)
       if not idx then
         return
       end
@@ -1107,7 +1196,7 @@ function cmake.run_test(opt)
         )
       end
     end)
-  )
+  end)
 end
 
 function cmake.run_current_file(opt)
@@ -1116,7 +1205,7 @@ function cmake.run_current_file(opt)
   local file = vim.fn.expand("%:p")
   local all_targets = config:launch_targets_with_sources()
   for i, target in ipairs(all_targets.data["sources"]) do
-    if target.path == file then
+    if target.path:lower() == file:lower() then
       table.insert(targets, target.name)
       table.insert(display_targets, target.display_name)
     end
@@ -1147,7 +1236,7 @@ function cmake.build_current_file(opt)
   local file = vim.fn.expand("%:p")
   local all_targets = config:build_targets_with_sources()
   for _, target in ipairs(all_targets.data["sources"]) do
-    if target.path == file then
+    if target.path:lower() == file:lower() then
       table.insert(targets, target.name)
       table.insert(display_targets, target.display_name)
     end
@@ -1273,11 +1362,24 @@ end
 --[[ end ]]
 
 function cmake.configure_compile_commands()
-  if const.cmake_soft_link_compile_commands then
+  local action = const.cmake_compile_commands_options.action
+  if action == "soft_link" then
     cmake.compile_commands_from_soft_link()
-  elseif const.cmake_compile_commands_from_lsp then
+  elseif action == "copy" then
+    cmake.copy_compile_commands()
+  elseif action == "lsp" then
     cmake.compile_commands_from_lsp()
   end
+end
+
+function cmake.copy_compile_commands()
+  if not config:has_build_directory() then
+    return
+  end
+
+  local source = config:build_directory_path() .. "/compile_commands.json"
+  local destination = const.cmake_compile_commands_options.target .. "/compile_commands.json"
+  utils.copyfile(source, destination)
 end
 
 function cmake.compile_commands_from_soft_link()
@@ -1286,7 +1388,7 @@ function cmake.compile_commands_from_soft_link()
   end
 
   local source = config:build_directory_path() .. "/compile_commands.json"
-  local destination = vim.loop.cwd() .. "/compile_commands.json"
+  local destination = const.cmake_compile_commands_options.target .. "/compile_commands.json"
   utils.softlink(source, destination)
 end
 
@@ -1404,7 +1506,7 @@ function cmake.create_regenerate_on_save_autocmd()
     ss = ss:gsub("}", "\\}")
     ss = ss:gsub("?", "\\?")
     ss = ss:gsub(",", "\\,")
-    table.insert(pattern, ss)
+    table.insert(pattern, config.cwd .. "/" .. ss)
   end
 
   local cwd = config.cwd
@@ -1494,7 +1596,7 @@ function cmake.register_autocmd()
             and all_targets.data["sources"]
           then
             for _, target in ipairs(all_targets.data["sources"]) do
-              if target.path == file then
+              if target.path:lower() == file:lower() then
                 table.insert(targets, { name = target.name, type = target.type })
               end
             end
@@ -1513,7 +1615,7 @@ function cmake.register_autocmd_provided_by_users()
 end
 
 function cmake.register_scratch_buffer(executor, runner)
-  if cmake.is_cmake_project() then
+  if cmake.is_cmake_project() and const.cmake_use_scratch_buffer then
     vim.schedule(function()
       scratch.create(executor, runner)
     end)
@@ -1669,7 +1771,7 @@ function cmake.register_dap_function()
       local file = vim.fn.expand("%:p")
       local all_targets = config:launch_targets_with_sources()
       for _, target in ipairs(all_targets.data["sources"]) do
-        if target.path == file then
+        if target.path:lower() == file:lower() then
           table.insert(targets, target.name)
           table.insert(display_targets, target.display_name)
         end

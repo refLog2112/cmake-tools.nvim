@@ -83,6 +83,19 @@ function utils.deepcopy(orig, copies)
   return copy
 end
 
+function utils.copyfile(src, target)
+  if utils.file_exists(src) then
+    -- if we don't always use terminal
+    local cmd = "exec "
+      .. "'!cmake -E copy "
+      .. utils.transform_path(src)
+      .. " "
+      .. utils.transform_path(target)
+      .. "'"
+    vim.cmd(cmd)
+  end
+end
+
 function utils.softlink(src, target)
   if utils.file_exists(src) and not utils.file_exists(target) then
     -- if we don't always use terminal
@@ -157,7 +170,7 @@ end
 -- @return true if exists else false
 function utils.has_active_job(runner_data, executor_data)
   return utils.get_executor(executor_data.name).has_active_job(executor_data.opts)
-    or utils.get_runner(runner_data.name).has_active_job(runner_data.opts)
+  -- or utils.get_runner(runner_data.name).has_active_job(runner_data.opts)
 end
 
 local notify_update_line = function(ntfy)
@@ -192,9 +205,11 @@ function utils.run(cmd, env_script, env, args, cwd, runner, callback)
 
   ntfy:notify(cmd, "info")
 
-  local _mes =
-    { "[RUN]:", cmd, table.concat(args, " "), "<ENV>", table.concat(env, " "), "{CWD}", cwd }
-  scratch.append(table.concat(_mes, " "))
+  if scratch.buffer ~= nil then
+    local _mes =
+      { "[RUN]:", cmd, table.concat(args, " "), "<ENV>", table.concat(env, " "), "{CWD}", cwd }
+    scratch.append(table.concat(_mes, " "))
+  end
 
   utils.get_runner(runner.name).run(cmd, env_script, env, args, cwd, runner.opts, function(code)
     local msg = "Exited with code " .. code
@@ -231,9 +246,11 @@ function utils.execute(cmd, env_script, env, args, cwd, executor, callback)
   local ntfy = notification:new("executor")
   ntfy:notify(cmd, "info")
 
-  local _mes =
-    { "[EXECUTE]:", cmd, table.concat(args, " "), "<ENV>", table.concat(env, " "), "{CWD}", cwd }
-  scratch.append(table.concat(_mes, " "))
+  if scratch.buffer ~= nil then
+    local _mes =
+      { "[EXECUTE]:", cmd, table.concat(args, " "), "<ENV>", table.concat(env, " "), "{CWD}", cwd }
+    scratch.append(table.concat(_mes, " "))
+  end
 
   utils
     .get_executor(executor.name)
@@ -278,6 +295,25 @@ function utils.get_nested(tbl, ...)
     end
   end
   return value
+end
+
+function utils.split_string_by_delimiter(s, delimiter, item)
+  local answer = {}
+  local delimiter1 = delimiter or ";"
+  for x in string.gmatch(s, "(.-)" .. delimiter1) do
+    table.insert(answer, x)
+  end
+  if #answer == 0 then
+    return nil
+  elseif item then -- does the user want an entry verses a parsed table?
+    if #answer >= item then
+      return answer[item]
+    else
+      return nil
+    end
+  else
+    return answer
+  end
 end
 
 return utils

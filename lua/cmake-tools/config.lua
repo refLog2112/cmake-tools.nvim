@@ -4,6 +4,8 @@ local Result = require("cmake-tools.result")
 -- local utils = require("cmake-tools.utils") -- Fails lua check. Uncomment this for testing
 local Types = require("cmake-tools.types")
 local variants = require("cmake-tools.variants")
+local Presets = require("cmake-tools.presets")
+local kits = require("cmake-tools.kits")
 
 local Config = {
   build_directory = nil,
@@ -82,6 +84,11 @@ function Config:update_build_dir(build_dir, no_expand_build_dir)
       "no_expand_build_dir needs to be a string or function returning string path to the build_directory"
     )
   end
+
+  if require("cmake-tools.osys").iswin32 then
+    build_dir = build_dir:gsub("/", "\\")
+  end
+
   local build_path = Path:new(build_dir)
   if build_path:is_absolute() then
     self.build_directory = Path:new(build_dir)
@@ -97,8 +104,8 @@ function Config:update_build_dir(build_dir, no_expand_build_dir)
 end
 
 ---Prepare build directory. Which allows macro expansion.
----@param kits table all the kits
-function Config:prepare_build_directory(kits)
+---@param kit_list table all the kits
+function Config:prepare_build_directory(kit_list)
   -- macro expansion:
   --       ${kit}
   --       ${kitGenerator}
@@ -108,8 +115,8 @@ function Config:prepare_build_directory(kits)
   local kit = self.kit
   local variant = self.variant
   local kit_info = nil
-  if kits then
-    for _, item in ipairs(kits) do
+  if kit_list then
+    for _, item in ipairs(kit_list) do
       if item.name == kit then
         kit_info = item
       end
@@ -210,7 +217,12 @@ function Config:get_codemodel_targets()
   end
   local codemodel = Path:new(found_files[1])
   local codemodel_json = vim.json.decode(codemodel:read())
-  return Result:new(Types.SUCCESS, codemodel_json["configurations"][1]["targets"], "find it")
+  for _, config in ipairs(codemodel_json["configurations"]) do
+    if config["name"] == self.build_type then
+      return Result:new(Types.SUCCESS, config["targets"], "find it")
+    end
+  end
+  return Result:new(Types.SUCCESS, codemodel_json["configurations"][1]["targets"], "find it") -- Return the first else
 end
 
 function Config:get_code_model_target_info(codemodel_target)
@@ -475,6 +487,118 @@ function Config:build_targets_with_sources()
     self:update_targets()
   end
   return _virtual_targets
+end
+
+function Config:update_build_type()
+  local presets_exists = self.base_settings.use_preset and Presets.exists(self.cwd)
+  if not presets_exists then
+    return
+  end
+  local presets = Presets:parse(self.cwd)
+  if not presets then
+    return
+  end
+  if not self.configure_preset then
+    return
+  end
+  local configure_preset =
+    presets:get_configure_preset(self.configure_preset, { include_hidden = true })
+  if not configure_preset then
+    return
+  end
+
+  self.build_type = configure_preset:get_build_type()
+
+  if not self.build_preset then
+    return
+  end
+  local build_preset = presets:get_build_preset(self.build_preset)
+  if not build_preset then
+    return
+  end
+  local configuration_types = configure_preset:get_build_configuration_types()
+
+  if not configuration_types then
+    return
+  end
+  local build_type_from_build_preset = build_preset:get_build_type()
+
+  if not build_type_from_build_preset then
+    return
+  end
+  local exists = false
+  for _, Item in ipairs(configuration_types) do
+    if Item == build_type_from_build_preset then
+      exists = true
+      break
+    end
+  end
+  if exists then
+    self.build_type = build_type_from_build_preset
+  end
+end
+
+function Config:update_build_target()
+  local presets_exists = self.base_settings.use_preset and Presets.exists(self.cwd)
+  if not presets_exists then
+    return
+  end
+
+  local presets = Presets:parse(self.cwd)
+  if not presets then
+    return
+  end
+  if not self.configure_preset then
+    return
+  end
+  local configure_preset =
+    presets:get_configure_preset(self.configure_preset, { include_hidden = true })
+  if not configure_preset then
+    return
+  end
+
+  if not self.build_preset then
+    return
+  end
+  local build_preset = presets:get_build_preset(self.build_preset)
+  if not build_preset then
+    return
+  end
+  local build_target = build_preset:get_build_target()
+  if build_target ~= nil then
+    self.build_target = build_target
+  end
+end
+
+function Config:update_build_directory()
+  local kits_config = kits.parse(self.cmake_kits_path, self.cwd)
+  if kits_config then
+    local build_dir = self:prepare_build_directory(kits_config)
+    self:update_build_dir(build_dir, self:no_expand_build_directory_path())
+    return
+  end
+
+  local presets_exists = self.base_settings.use_preset and Presets.exists(self.cwd)
+  if not presets_exists then
+    return
+  end
+  local presets = Presets:parse(self.cwd)
+  if presets then
+    if not self.configure_preset then
+      return
+    end
+    local configure_preset =
+      presets:get_configure_preset(self.configure_preset, { include_hidden = true })
+    if not configure_preset then
+      return
+    end
+
+    local build_directory, no_expand_build_directory =
+      configure_preset.binaryDirExpanded, configure_preset.binaryDir
+    if build_directory ~= "" then
+      self:update_build_dir(build_directory, no_expand_build_directory)
+    end
+  end
 end
 
 return Config
